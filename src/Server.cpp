@@ -23,6 +23,15 @@ int main(int argc, char* argv[]) {
             std::cerr << "Failed to open the database file" << std::endl;
             return 1;
         }
+        std::string text(std::istreambuf_iterator<char>(database_file), {});
+
+        int table_count = 0;
+        int pos = text.find("CREATE TABLE");
+        while(pos != -1)
+        {
+            table_count++;
+            pos = text.find("CREATE TABLE", pos+1);
+        }
 
         database_file.seekg(16);  // Skip the first 16 bytes of the header
         
@@ -32,6 +41,7 @@ int main(int argc, char* argv[]) {
         unsigned short page_size = (static_cast<unsigned char>(buffer[1]) | (static_cast<unsigned char>(buffer[0]) << 8));
         
         std::cout << "database page size: " << page_size << std::endl;
+        std::cout << "number of tables: " << table_count << '\n';
     }
 
     return 0;
