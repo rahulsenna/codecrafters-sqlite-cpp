@@ -3,6 +3,9 @@
 #include <fstream>
 #include <algorithm>
 #include <cassert>
+#include <unordered_map>
+#include <map>
+#include <ranges>
 
 // Returns number of bytes consumed
 int parse_varint(const unsigned char *p, uint64_t *value)
@@ -19,16 +22,17 @@ int parse_varint(const unsigned char *p, uint64_t *value)
     return 9;
 }
 
-struct table_info
+struct Table
 {
     std::string name;
     std::string sql;
     int rootpage;
-    uint64_t row_count;
+    uint64_t row_count = 0;
+    std::vector<std::vector<std::string>> rows;
 };
 
 // Parse a cell in a leaf table page to extract table names
-table_info get_tbl_info(const unsigned char *cell)
+Table get_tbl_info(const unsigned char *cell)
 {
     int offset = 0;
     uint64_t payload_size;
@@ -55,9 +59,9 @@ table_info get_tbl_info(const unsigned char *cell)
     int data_offset = header_size;
     
     // columns: 0 type | 1 name | 2 tbl_name | 3 rootpage | 4 sql
-    table_info res = {};
+    Table res = {};
     int root_page = -1;
-    for (int i = 0; i < 4; i++)
+    for (int i = 0; i < 5; i++)
     {
         uint64_t serial_type = column_types[i];
         
@@ -76,20 +80,16 @@ table_info get_tbl_info(const unsigned char *cell)
             if (serial_type == 1)
             {
                 root_page = (int) payload[data_offset];
-                data_offset += 1;
             } else if (serial_type == 2)
             {
-                data_offset += 2;
                 root_page = ((int) payload[data_offset] << 8) | payload[data_offset + 1];
             } else if (serial_type == 3)
             {
-                data_offset += 3;
                 root_page = ((int) payload[data_offset] << 16) |
                             ((int) payload[data_offset + 1] << 8) |
                             payload[data_offset + 2];
             } else if (serial_type == 4)
             {
-                data_offset += 4;
                 root_page = ((int) payload[data_offset] << 24) |
                             ((int) payload[data_offset + 1] << 16) |
                             ((int) payload[data_offset + 2] << 8) |
@@ -111,11 +111,46 @@ int get_page_size(std::ifstream &database_file)
     return page_size;
 }
 
-// Count rows by traversing a B-tree
-int count_rows_recursive(const unsigned char *page_data, int page_size, int page_number)
+void parse_cell_data(Table &table, const unsigned char *cell)
+{
+    int offset = 0;
+    uint64_t payload_size;
+    offset += parse_varint(cell + offset, &payload_size);
+    
+    uint64_t rowid;
+    offset += parse_varint(cell + offset, &rowid);
+    
+    const unsigned char *payload = cell + offset;
+    uint8_t header_size = payload[0];
+    
+    int header_offset = 1;  // Skip header size byte
+    int column_count = 0;
+    std::vector<std::string> row_of_str;
+    while (header_offset < header_size) 
+    {
+        uint64_t serial_type;
+        header_offset += parse_varint(payload + header_offset, &serial_type);
+        column_count++;
+        if (serial_type > 13)
+        {
+            size_t str_size = (serial_type-13)/2;
+            row_of_str.push_back(std::string(str_size,'*'));
+        }
+    }
+    
+    payload += header_size;
+    for (auto &str: row_of_str)
+    {
+    	str = std::string((char*)payload, str.length());
+        payload += str.length();
+    }
+    table.rows.push_back(row_of_str);
+}
+
+void process_table_data_rec(Table &table, const unsigned char *page_data, int page_size, int page_number)
 {
     if (page_number <= 0)
-        return 0;
+        return;
     const unsigned char *curr_page = page_data + (page_number - 1) * page_size;
 
     // Determine page type and header size
@@ -123,12 +158,20 @@ int count_rows_recursive(const unsigned char *page_data, int page_size, int page
     int page_header_size = 0;
     uint8_t page_type = curr_page[page_header_size];
     
-    int row_count = 0;
-
     if (page_type == 0x0D) // PAGE_TYPE_BTREE_LEAF
     {
         // Get cell count (2 bytes at offset 3 in b-tree header)
-        row_count = (curr_page[3] << 8) | curr_page[4];
+        int cell_count = (curr_page[3] << 8) | curr_page[4];
+        table.row_count += cell_count;
+
+        int cell_ptr_offset = 8;
+        for (int i = 0; i < cell_count; ++i)
+        {
+            unsigned short cell_content_offset = curr_page[cell_ptr_offset + i * 2] << 8 |
+                                                 (unsigned char) curr_page[cell_ptr_offset + i * 2 + 1];
+
+            parse_cell_data(table, curr_page+cell_content_offset);
+        }
     }
     else if (page_type == 0x02) // PAGE_TYPE_BTREE_INTERIOR
     {
@@ -141,7 +184,7 @@ int count_rows_recursive(const unsigned char *page_data, int page_size, int page
                               (curr_page[page_header_size + 10] << 8) |
                               curr_page[page_header_size + 11];
         
-        row_count += count_rows_recursive(page_data, page_size, rightmost_child);
+        process_table_data_rec(table, page_data, page_size, rightmost_child);
         
         // Cell pointer array starts at offset 12 in interior page header
         int cell_pointer_array = page_header_size + 12;
@@ -157,18 +200,18 @@ int count_rows_recursive(const unsigned char *page_data, int page_size, int page
                              (curr_page[cell_offset + 2] << 8) |
                              curr_page[cell_offset + 3];
 
-            row_count += count_rows_recursive(page_data, page_size, child_page);
+            process_table_data_rec(table, page_data, page_size, child_page);
         }
     }
     else
     {
         printf("Unknown page type: %d\n", page_type);
     }
-    return row_count;
+    
 }
 
 
-std::vector<table_info> get_table_names(std::ifstream &database_file)
+std::map<std::string, Table> get_table_names(std::ifstream &database_file)
 {
     unsigned short page_size = get_page_size(database_file);
     assert(page_size< 4096*10);
@@ -186,21 +229,18 @@ std::vector<table_info> get_table_names(std::ifstream &database_file)
     unsigned short cell_count = cell_cnt_buf[0] << 8 | (unsigned char)cell_cnt_buf[1];
 
     int cell_ptr_offset = 108; // end of database(b-tree) header
-    unsigned char num[2];
-    std::vector<table_info> res;
+    std::map<std::string, Table> res;
     for (int i = 0; i < cell_count; ++i)
     {
-        num[0] = buffer[cell_ptr_offset++];
-        num[1] = buffer[cell_ptr_offset++];
-    	unsigned short cell_content_offset =  num[0]<<8 | (unsigned char)num[1];
-        auto tbl = get_tbl_info(buffer+cell_content_offset);
-        if (not tbl.name.empty())
+        unsigned short cell_content_offset = buffer[cell_ptr_offset + i * 2] << 8 | (unsigned char) buffer[cell_ptr_offset + i * 2 + 1];
+        auto table = get_tbl_info(buffer+cell_content_offset);
+        if (not table.name.empty())
         {
-            if (tbl.rootpage > 0)
+            if (table.rootpage > 0)
             {
-                tbl.row_count = count_rows_recursive(buffer, page_size, tbl.rootpage);
+                process_table_data_rec(table, buffer, page_size, table.rootpage);
             }
-            res.push_back(tbl);
+            res[table.name] = table;
         }
             
     }
@@ -237,25 +277,45 @@ int main(int argc, char* argv[]) {
     else if (command == ".tables")
     {
         auto tables = get_table_names(database_file);
-        for (auto table: tables)
+        for (auto [name, table]: tables)
         {
-        	std::cout << table.name << ' ';
+        	std::cout << name << ' ';
         }
     }
     else if (command.starts_with("select count(*) from"))
     {
         auto tables = get_table_names(database_file);
         auto table_name = command.substr(command.find_last_of(' ') + 1, INT_MAX);
-        for (auto table: tables)
-        {
-        	if (table.name == table_name)
-        	{
-        		std::cout << table.row_count << '\n';
-        	}
-        }
+        
+        std::cout << tables[table_name].row_count << '\n';
         
     }
+    else if (command.starts_with("select "))
+    {
+        char col_name[256];
+        char table_name[256];
+        sscanf(command.c_str(), "select %s from %s", col_name, table_name);
 
+        auto table = get_table_names(database_file)[table_name];
+
+        auto col_name_str = table.sql.substr(table.sql.find_first_of(',')+2, INT_MAX);
+        auto cols = std::views::split(col_name_str, ',') | std::ranges::to<std::vector<std::string>>();
+
+        int col_idx = -1;
+        for (int i = 0; i < cols.size(); ++i)
+        {
+        	 if (cols[i].compare(0, strlen(col_name), col_name) == 0) // didn't use "==" because of trailing text in cols name
+        	 {
+                 col_idx = i;
+                 break;
+             }
+        }
+        for (auto row: table.rows)
+        {
+        	std::cout << row[col_idx] << '\n';
+        }
+    }
+    
 
     return 0;
 }
