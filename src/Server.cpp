@@ -211,7 +211,7 @@ void process_table_data_rec(Table &table, const unsigned char *page_data, int pa
 }
 
 
-std::map<std::string, Table> get_table_names(std::ifstream &database_file)
+std::map<std::string, Table> get_tables(std::ifstream &database_file)
 {
     unsigned short page_size = get_page_size(database_file);
     assert(page_size< 4096*10);
@@ -247,6 +247,14 @@ std::map<std::string, Table> get_table_names(std::ifstream &database_file)
     return(res);
 }
 
+auto trim_white_space = [](auto &&range)
+{
+    std::string s(range.begin(), range.end());
+    int beg = s.find_first_not_of(" \n\t");
+    auto size = s.find_first_of(" \n\t", beg)-beg;
+    return s.substr(beg, size);
+};
+
 int main(int argc, char* argv[]) {
     // Flush after every std::cout / std::cerr
     std::cout << std::unitbuf;
@@ -272,11 +280,11 @@ int main(int argc, char* argv[]) {
     if (command == ".dbinfo")
     {
         std::cout << "database page size: " << get_page_size(database_file) << std::endl;
-        std::cout << "number of tables: " << get_table_names(database_file).size() << '\n';
+        std::cout << "number of tables: " << get_tables(database_file).size() << '\n';
     }
     else if (command == ".tables")
     {
-        auto tables = get_table_names(database_file);
+        auto tables = get_tables(database_file);
         for (auto [name, table]: tables)
         {
         	std::cout << name << ' ';
@@ -284,7 +292,7 @@ int main(int argc, char* argv[]) {
     }
     else if (command.starts_with("select count(*) from"))
     {
-        auto tables = get_table_names(database_file);
+        auto tables = get_tables(database_file);
         auto table_name = command.substr(command.find_last_of(' ') + 1, INT_MAX);
         
         std::cout << tables[table_name].row_count << '\n';
@@ -292,27 +300,36 @@ int main(int argc, char* argv[]) {
     }
     else if (command.starts_with("select "))
     {
-        char col_name[256];
-        char table_name[256];
-        sscanf(command.c_str(), "select %s from %s", col_name, table_name);
+        auto table_name = command.substr(command.find_last_of(' ') + 1, INT_MAX);
+        auto table = get_tables(database_file)[table_name];
 
-        auto table = get_table_names(database_file)[table_name];
+        int beg = strlen("select "), str_len = command.find(" from")-beg;
+        auto search_cols_str = command.substr(beg, str_len);
+        auto search_cols = search_cols_str | std::views::split(',') |
+                           std::views::transform(trim_white_space) |
+                           std::ranges::to<std::vector<std::string>>();
 
-        auto col_name_str = table.sql.substr(table.sql.find_first_of(',')+2, INT_MAX);
-        auto cols = std::views::split(col_name_str, ',') | std::ranges::to<std::vector<std::string>>();
+        auto every_col_str = table.sql.substr(table.sql.find_first_of(',') + 2, INT_MAX);
 
-        int col_idx = -1;
-        for (int i = 0; i < cols.size(); ++i)
+        auto every_col = every_col_str | std::views::split(',') |
+                    std::views::transform(trim_white_space) |
+                    std::ranges::to<std::vector<std::string>>();
+
+        std::vector<int> col_indexes;
+        for (auto search_col_name : search_cols)
         {
-        	 if (cols[i].compare(0, strlen(col_name), col_name) == 0) // didn't use "==" because of trailing text in cols name
-        	 {
-                 col_idx = i;
-                 break;
-             }
+            auto it = std::find(every_col.begin(), every_col.end(), search_col_name);
+            if (it != every_col.end())
+                col_indexes.push_back(std::distance(every_col.begin(), it));
         }
+
         for (auto row: table.rows)
         {
-        	std::cout << row[col_idx] << '\n';
+            int i = 0;
+            for (; (i+1) < col_indexes.size(); i++)
+            	std::cout << row[col_indexes[i]] << '|';
+            
+            std::cout << row[col_indexes[i]] << '\n';
         }
     }
     
