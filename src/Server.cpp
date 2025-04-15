@@ -300,8 +300,11 @@ int main(int argc, char* argv[]) {
     }
     else if (command.starts_with("select "))
     {
-        auto table_name = command.substr(command.find_last_of(' ') + 1, INT_MAX);
+        auto table_name_beg = command.find("from ") + strlen("from ");
+        auto table_name_end = command.find_first_of(" \n", table_name_beg+1);
+        auto table_name = command.substr(table_name_beg, table_name_end-table_name_beg);
         auto table = get_tables(database_file)[table_name];
+        assert(not table.name.empty());
 
         int beg = strlen("select "), str_len = command.find(" from")-beg;
         auto search_cols_str = command.substr(beg, str_len);
@@ -323,8 +326,29 @@ int main(int argc, char* argv[]) {
                 col_indexes.push_back(std::distance(every_col.begin(), it));
         }
 
+        bool filter = false;
+        int filter_col_idx = 0;
+        std::string filter_str;
+        auto where = command.find("where ");
+        if (where != -1)
+        {
+        	filter = true;
+            int beg = where + strlen("where ");
+            int end = command.find_first_of(" ", beg);
+            std::string filter_col_name = command.substr(beg, end-beg);
+            auto it = std::find(every_col.begin(), every_col.end(), filter_col_name);
+            if (it != every_col.end())
+                filter_col_idx = std::distance(every_col.begin(), it);
+
+            beg = command.find_first_of("'", end)+1;
+            end = command.find_first_of("'", beg+1);
+            filter_str = command.substr(beg, end-beg);
+        }
+
         for (auto row: table.rows)
         {
+            if (filter and row[filter_col_idx] != filter_str)
+                continue;
             int i = 0;
             for (; (i+1) < col_indexes.size(); i++)
             	std::cout << row[col_indexes[i]] << '|';
