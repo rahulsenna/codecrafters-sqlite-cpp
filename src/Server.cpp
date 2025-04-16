@@ -136,6 +136,8 @@ void parse_cell_data(Table &table, const unsigned char *cell)
             size_t str_size = (serial_type-13)/2;
             row_of_str.push_back(std::string(str_size,'*'));
         }
+        else
+            row_of_str.push_back(std::string());
     }
     
     payload += header_size;
@@ -144,6 +146,7 @@ void parse_cell_data(Table &table, const unsigned char *cell)
     	str = std::string((char*)payload, str.length());
         payload += str.length();
     }
+    row_of_str[0] = std::to_string(rowid);
     table.rows.push_back(row_of_str);
 }
 
@@ -173,7 +176,7 @@ void process_table_data_rec(Table &table, const unsigned char *page_data, int pa
             parse_cell_data(table, curr_page+cell_content_offset);
         }
     }
-    else if (page_type == 0x02) // PAGE_TYPE_BTREE_INTERIOR
+    else if (page_type == 0x02 or page_type == 0x05) // PAGE_TYPE_BTREE_INTERIOR
     {
         // Interior page - follow all child pointers
         int cell_count = (curr_page[page_header_size + 3] << 8) | curr_page[page_header_size + 4];
@@ -214,12 +217,12 @@ void process_table_data_rec(Table &table, const unsigned char *page_data, int pa
 std::map<std::string, Table> get_tables(std::ifstream &database_file)
 {
     unsigned short page_size = get_page_size(database_file);
-    assert(page_size< 4096*10);
-    unsigned char buffer[4096*10];
+    unsigned char *buffer = (unsigned char *) malloc(4096*1000);
     // Get file size
     database_file.seekg(0, std::ios::end);
     size_t size = database_file.tellg();
     database_file.seekg(0, std::ios::beg);
+    assert(size < 4096*1000);
     
     database_file.read((char *)buffer,size);
 
@@ -244,6 +247,7 @@ std::map<std::string, Table> get_tables(std::ifstream &database_file)
         }
             
     }
+    free(buffer);
     return(res);
 }
 
@@ -269,6 +273,12 @@ int main(int argc, char* argv[]) {
 
     std::string database_file_path = argv[1];
     std::string command = argv[2];
+    for (auto &c: command)
+    {
+        if (c == '\'')
+            break;
+        c = std::tolower( c);
+    }
 
     std::ifstream database_file(database_file_path, std::ios::binary);
     if (!database_file) 
@@ -312,7 +322,7 @@ int main(int argc, char* argv[]) {
                            std::views::transform(trim_white_space) |
                            std::ranges::to<std::vector<std::string>>();
 
-        auto every_col_str = table.sql.substr(table.sql.find_first_of(',') + 2, INT_MAX);
+        auto every_col_str = table.sql.substr(table.sql.find_first_of('(') + 1, INT_MAX);
 
         auto every_col = every_col_str | std::views::split(',') |
                     std::views::transform(trim_white_space) |
