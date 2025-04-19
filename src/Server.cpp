@@ -35,7 +35,7 @@ struct Schema_Table_Info
     std::string sql;
     int rootpage{};
     uint64_t row_count = 0;
-    std::vector<const unsigned char *> cells;
+    std::vector<uint64_t> cells;
     std::vector<int> index_rowids;
 };
 
@@ -134,17 +134,26 @@ inline int get_page_size(const unsigned char *buffer)
     return (buffer[16] << 8 | (unsigned short)buffer[17]);
 }
 
-void print_row(const unsigned char *cell, const std::vector<int>& col_indexes,
+void print_row(std::ifstream &file, uint64_t ptr, const std::vector<int>& col_indexes,
 const bool filter, const int filter_col_idx, const std::string_view filter_str)
 {
+    unsigned char temp_buf[9];
+    file.seekg(ptr);
+    file.read((char*)temp_buf, 9);
+
     int offset = 0;
     uint64_t payload_size;
-    offset += parse_varint(cell + offset, &payload_size);
+    offset += parse_varint(temp_buf, &payload_size);
+
+    file.seekg(ptr+offset);
+    file.read((char*)temp_buf, 9);
 
     uint64_t rowid;
-    offset += parse_varint(cell + offset, &rowid);
+    offset += parse_varint(temp_buf, &rowid);
 
-    const unsigned char *payload = cell + offset;
+    file.seekg(ptr+offset);
+    unsigned char payload[1024];
+    file.read((char*)payload, payload_size);
     const uint8_t header_size = payload[0];
 
     int header_offset = 1;  // Skip header size byte
@@ -223,7 +232,7 @@ std::pair<std::string_view, int> parse_index_cell (const unsigned char *cell)
         assert(0);
         int overflow_page = (payload[0] << 24) |
                             (payload[1] << 16) | (payload[2] << 8) | payload[3];
-        
+
         if (overflow_page > 0)
         {
             // todo: Process overflow data
@@ -233,15 +242,18 @@ std::pair<std::string_view, int> parse_index_cell (const unsigned char *cell)
     return {country, row_id};
 }
 
-void scan_index_rec(Schema_Table_Info &table, const unsigned char *page_data,
-                    const int page_size, const int page_number, std::string_view search_country)
+void scan_index_rec(Schema_Table_Info &table, std::ifstream &file,
+                    const int page_size, const int page_number, const std::string_view search_country)
 {
     if (page_number <= 0)
         return;
 
-    const unsigned char *curr_page = page_data + (page_number - 1) * page_size;
+    unsigned char curr_page[4096];
+    file.seekg((page_number - 1) * page_size);
+    file.read((char*)(curr_page), 4096);
+
     uint8_t page_type = curr_page[0];
-    
+
     if (page_type == LEAF_INDEX)
     {
         const int cell_count = (curr_page[3] << 8) | curr_page[4];
@@ -262,7 +274,7 @@ void scan_index_rec(Schema_Table_Info &table, const unsigned char *page_data,
         }
     }
     else if (page_type == INTERIOR_INDEX)
-    { 
+    {
         int cell_count = (curr_page[3] << 8) | curr_page[4];
         int cell_pointer_array = 12;
 
@@ -280,12 +292,12 @@ void scan_index_rec(Schema_Table_Info &table, const unsigned char *page_data,
 
             if (comparison < 0)
             {
-                scan_index_rec(table, page_data, page_size, child_page, search_country);
+                scan_index_rec(table, file, page_size, child_page, search_country);
                 return;
             }
             else if (comparison == 0)
             {
-                scan_index_rec(table, page_data, page_size, child_page, search_country);
+                scan_index_rec(table, file, page_size, child_page, search_country);
                 table.index_rowids.emplace_back(row_id);
             }
         }
@@ -293,7 +305,7 @@ void scan_index_rec(Schema_Table_Info &table, const unsigned char *page_data,
         // If key is larger than everything in current page, follow rightmost child
         int rightmost_child = (curr_page[8] << 24) | (curr_page[9] << 16) |
                               (curr_page[10] << 8) | curr_page[11];
-        scan_index_rec(table, page_data, page_size, rightmost_child, search_country);
+        scan_index_rec(table, file, page_size, rightmost_child, search_country);
     }
     else
     {
@@ -303,13 +315,16 @@ void scan_index_rec(Schema_Table_Info &table, const unsigned char *page_data,
 
 
 
-void scan_table_rec(Schema_Table_Info &table, const unsigned char *page_data,
+void scan_table_rec(Schema_Table_Info &table, std::ifstream &file,
     const int page_size, const int page_number, int search_row_id = 0)
 {
     if (page_number <= 0)
         return;
 
-    const unsigned char *curr_page = page_data + (page_number - 1) * page_size;
+    unsigned char curr_page[4096];
+    file.seekg((page_number - 1) * page_size);
+    file.read((char*)curr_page, 4096);
+
     uint8_t page_type = curr_page[0];
 
     if (page_type == LEAF_TABLE)
@@ -327,7 +342,7 @@ void scan_table_rec(Schema_Table_Info &table, const unsigned char *page_data,
 
             if (!search_row_id)
             {
-                table.cells.emplace_back(cell);
+                table.cells.emplace_back((page_number - 1) * page_size + cell_offset);
                 continue;
             }
 
@@ -340,7 +355,7 @@ void scan_table_rec(Schema_Table_Info &table, const unsigned char *page_data,
 
             if (rowid == search_row_id)
             {
-                table.cells.emplace_back(cell);
+                table.cells.emplace_back((page_number - 1) * page_size + cell_offset);
             }
         }
     }
@@ -360,7 +375,7 @@ void scan_table_rec(Schema_Table_Info &table, const unsigned char *page_data,
 
             if (!search_row_id)
             {
-                scan_table_rec(table, page_data, page_size, child_page, 0);
+                scan_table_rec(table, file, page_size, child_page, 0);
                 continue;
             }
 
@@ -369,7 +384,7 @@ void scan_table_rec(Schema_Table_Info &table, const unsigned char *page_data,
 
             if (search_row_id <= key)
             {
-                scan_table_rec(table, page_data, page_size, child_page, search_row_id);
+                scan_table_rec(table, file, page_size, child_page, search_row_id);
                 return;
             }
         }
@@ -378,7 +393,7 @@ void scan_table_rec(Schema_Table_Info &table, const unsigned char *page_data,
                               (curr_page[9] << 16) |
                               (curr_page[10] << 8) |
                               curr_page[11];
-        scan_table_rec(table, page_data, page_size, rightmost_child, search_row_id);
+        scan_table_rec(table, file, page_size, rightmost_child, search_row_id);
     }
     else
     {
@@ -434,18 +449,20 @@ int main(int argc, char* argv[])
     }
 
     std::ifstream database_file(database_file_path, std::ios::binary);
-    if (!database_file) 
+    if (!database_file)
     {
         std::cerr << "Failed to open the database file" << std::endl;
         return 1;
     }
 
-    database_file.seekg(0, std::ios::end);
-    size_t file_size = database_file.tellg();
-    database_file.seekg(0, std::ios::beg);
-    auto *buffer = (unsigned char *) malloc(file_size);
-    database_file.read((char *)buffer,file_size);
-    int page_size = get_page_size(buffer);
+    unsigned char page[2];
+    database_file.seekg(16);
+    database_file.read((char*)page, 2);
+    int page_size = (page[0] << 8 | (unsigned short) page[1]);
+    database_file.seekg(0);
+    auto *buffer = (unsigned char *) malloc(page_size);
+    database_file.read((char *)buffer,page_size);
+
 
     if (command == ".dbinfo")
     {
@@ -465,7 +482,7 @@ int main(int argc, char* argv[])
         auto tables = get_tables(buffer);
         auto table_name = command.substr(command.find_last_of(' ') + 1, INT_MAX);
         auto table = tables[table_name];
-        scan_table_rec(table, buffer, page_size, table.rootpage);
+        scan_table_rec(table, database_file, page_size, table.rootpage);
         std::cout << table.row_count << '\n';
 
     }
@@ -532,7 +549,7 @@ int main(int argc, char* argv[])
             if (maybe_index.type == "index" && maybe_index.tbl_name == table_name)
             {
                 index = maybe_index;
-                scan_index_rec(index, buffer, page_size, index.rootpage, filter_str);
+                scan_index_rec(index, database_file, page_size, index.rootpage, filter_str);
                 break;
             }
         }
@@ -540,20 +557,20 @@ int main(int argc, char* argv[])
         // Scan table based on index or full scan
         if (index.name.empty())
         {
-            scan_table_rec(table, buffer, page_size, table.rootpage);
+            scan_table_rec(table, database_file, page_size, table.rootpage);
         }
         else
         {
             for (auto row_id : index.index_rowids)
             {
-                scan_table_rec(table, buffer, page_size, table.rootpage, row_id);
+                scan_table_rec(table, database_file, page_size, table.rootpage, row_id);
             }
         }
 
         // Print results
         for (auto cell : table.cells)
         {
-            print_row(cell, col_indexes, filter, filter_col_idx, filter_str);
+            print_row(database_file, cell, col_indexes, filter, filter_col_idx, filter_str);
         }
     }
 
